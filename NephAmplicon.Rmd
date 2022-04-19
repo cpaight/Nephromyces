@@ -1,0 +1,266 @@
+---
+title: "NephAmpliconAnalysis"
+author: "cpaight"
+date: "4/19/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r library load}
+library(dada2)
+library(dplyr)
+library(ggplot2)
+library(janitor)
+
+```
+```{bash trimadaptors}
+for sample in $(cat samples)
+do
+
+    echo "On sample: $sample"
+    
+    cutadapt -a AGTTACYYTAGGGATAACAGCG...ACRTGATCTGAGTTCAGACCGG \
+    -A CCGGTCTGAACTCAGATCAYGT...CGCTGTTATCCCTARRGTAACT \
+    -m 100 --discard-untrimmed \
+    -o ${sample}_sub_R1_trimmed.fq.gz -p ${sample}_sub_R2_trimmed.fq.gz \
+    ${sample}_R1.fastq.gz ${sample}_R2.fastq.gz \
+    >> cutadapt_primer_trimming_stats.txt 2>&1
+done
+```
+```{r dada2 processing}
+samples <- scan("samples", what="character")
+forward_reads <- paste0(samples, "_sub_R1_trimmed.fq.gz")
+reverse_reads <- paste0(samples, "_sub_R2_trimmed.fq.gz")
+filtered_forward_reads <- paste0(samples, "_sub_R1_filtered.fq.gz")
+filtered_reverse_reads <- paste0(samples, "_sub_R2_filtered.fq.gz")
+plotQualityProfile(forward_reads)
+plotQualityProfile(reverse_reads)
+
+filtered_out <- filterAndTrim(forward_reads, filtered_forward_reads,
++                               reverse_reads, filtered_reverse_reads,
++                               rm.phix=TRUE, minLen = 50, truncQ = 2, maxEE = c(2, 2), truncLen = 150)
+
+filtered_out
+plotQualityProfile(filtered_forward_reads)
+plotQualityProfile(filtered_reverse_reads)
+err_forward_reads <- learnErrors(filtered_forward_reads, multithread = TRUE, nbases = 5e+08)
+err_reverse_reads <- learnErrors(filtered_reverse_reads, multithread = TRUE, nbases = 5e+08)
+plotErrors(err_forward_reads, nominalQ=TRUE)
+plotErrors(err_reverse_reads, nominalQ=TRUE)
+derep_forward <- derepFastq(filtered_forward_reads, verbose=TRUE)
+names(derep_forward) <- samples
+derep_reverse <- derepFastq(filtered_reverse_reads, verbose=TRUE)
+names(derep_reverse) <- samples
+dada_forward <- dada(derep_forward, err=err_forward_reads, pool="pseudo")
+dada_reverse <- dada(derep_reverse, err=err_reverse_reads, pool="pseudo")
+merged_amplicons <- mergePairs(dada_forward, derep_forward, dada_reverse, derep_reverse, trimOverhang=TRUE, minOverlap=100)
+seqtab <- makeSequenceTable(merged_amplicons)
+seqtab.nochim <- removeBimeraDenovo(seqtab, verbose=T)
+sum(seqtab.nochim)/sum(seqtab)
+getN <- function(x) sum(getUniques(x))
+summary_tab <- data.frame(row.names=samples, dada2_input=filtered_out[,1],
+               filtered=filtered_out[,2], dada_f=sapply(dada_forward, getN),
+               dada_r=sapply(dada_reverse, getN), merged=sapply(merged_amplicons, getN),
+               nonchim=rowSums(seqtab.nochim),
+               final_perc_reads_retained=round(rowSums(seqtab.nochim)/filtered_out[,1]*100, 1))
+write.table(summary_tab, file='ReadTrimSum.txt', sep= '\t', quote=FALSE)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "ASVs.fa")
+asv_tab <- t(seqtab.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+```
+```{bash cdhit,blast}
+#Cd-hit-est
+cd-hit-est -i ASVs.fa -o Cop1697.fa -c 0.97 -n 10 -s 0.9
+
+#Blast
+#Local
+blastn -db /Users/paight/BlastDB/nt -query ASVs.fa -outfmt '6 qseqid  pident length staxids' -max_target_seqs 10 -num_threads 6 -out 18Local.out -negative_gilist /Users/paight/BlastDB/sequence.gi
+
+#Server
+#!/bin/bash
+#SBATCH -J TotalBlast
+#SBATCH -t 10:00:00
+#SBATCH -N 1
+#SBATCH -n 20
+#SBATCH --constraint=intel
+#SBATCH --account=epscor-condo
+
+#module load blast
+
+#blastn -db nt.42 \
+#-query Cop1697.fa \
+#-out NephByPurineGenes.out \
+#-outfmt '6 qseqid sseqid pident length sskingdoms sblastnames sgi staxids sscinames scomnames' \
+#-max_target_seqs 10 \
+#-num_threads 20
+
+#Untar multiple files
+ls *.gz |xargs -n1 tar -xzf
+
+#Cut fields
+cut -f1,3,4,8 Cop1697.out > Copcuttest.txt
+```
+
+```{r process taxonomy}
+coi <- read.delim("~/Desktop/coi.out", stringsAsFactors=FALSE)
+require(dplyr)
+Coi <- coi[coi$length>=200 , ]
+Coi$correction <- Coi$percent/100 *Coi$length
+argo <- Coi %>% group_by(ASV) %>%filter(correction == max(correction))
+test3 <- argo %>% group_by(ASV)%>%summarise_all(funs( toString(unique(.))))
+write.table(test3, file='COItaxa2.txt', sep='\t', quote=FALSE, row.names=FALSE)
+coi <- LrCOI97Final[LrCOI97Final$percent>=97&LrCOI97Final$Length>=290 , ]
+Mol16 <- Mol16FB97Final[Mol16FB97Final$percent>=99&Mol16FB97Final$Length>=170 , ]
+coiF <- coi[!duplicated(coi[,c('ASV','Seqid')]),]
+coi$correction <- coi$percent/100 *coi$length
+argo <- coi %>% group_by(ASV) %>%filter(correction == max(correction))
+argo1 <- argo %>% group_by(ASV,percent,length) %>% summarise(taxid = paste(taxid, collapse=", ")
+test3 <- argo %>% group_by(ASV)%>%summarise_all(funs( toString(unique(.))))
+xx <- merge(Cop16Finaltaxa,CopSciName, by =c('Seqid'))
+```
+```{bash add taxonomic information}
+grep -E '(TaxId|ScientificName|GenbankCommonName|Rank)' taxonomy_result.xml > Test.txt
+    <TaxId>(\d+)</TaxId>\n    <ScientificName>(.+)</ScientificName>\n        <GenbankCommonName>(.+)</GenbankCommonName>\n    <ParentTaxId>.+</ParentTaxId>\n    <Lineage>(.+)</Lineage>\n
+
+\1\t\2\t\3\t\4\n
+```
+```{r merge count table and taxonomy}
+#Merge asv cout table
+xx <- merge(argo1,ASVs_counts, by =c('ASV'))
+#Merge count and taxonomy
+xy <- merge(xx,TaxonomyResults, by =c('taxid'))
+xx <- merge(GenF,GeneFishTaxonmyFullLine, by =c('Taxid'))
+xy <- merge(ASV_cls_map,xx, by =c('ASV'))
+#‘Merge count table by asv’
+```
+```{r get coulumn sums}
+require(janitor)
+xls <- ASVs_counts %>%adorn_totals("row")
+Merge by cluster
+xx <- merge(ASV_cls_map,ASVs_counts, by =c('ASV'))
+Delete ASV
+xx$ASV <- NULL
+Merge reads
+require(dplyr)
+elmo <- xx %>% group_by(cluster) %>%summarise_each(funs(sum))
+coi <- COIWocluster[COIWocluster$percent>=97&COIWocluster$length>=290 , ]
+coi$correction <- coi$percent/100 *coi$length
+argo <- coi %>% group_by(ASV) %>%filter(correction == max(correction))
+argo$GI <- NULL
+argo <- distinct(argo)
+argo1 <- argo %>% group_by(ASV) %>% summarise(taxid = paste(taxid, collapse=", "))
+elmo <- xl %>% group_by(taxid,Species,common,kingdom,phylum,class,order,family,genus) %>% summarise_if(is.numeric, funs(sum = sum(.)))
+elmo1 <- xl %>% group_by(taxid) %>% summarise(ASV = paste(ASV, collapse=", "))
+elmo3 <- merge(elmo1,elmo,by=c('taxid'))
+xy <- xx %>% group_by(taxid) %>% summarise_each(funs(sum))
+rat <- merge(argo1,xy, by =c('taxid'))
+clock <- rat %>% group_by(taxid) %>% summarise(ASV = paste(ASV, collapse=", "))
+COICountByTaxon$ASV.y <- NULL
+COICountByTaxon <- distinct(COICountByTaxon)
+argo <- xy %>% group_by(taxid,species,common,kingdom,phylum,class,order,family,genus) %>%summarise_at(vars(starts_with("LC_")), funs(sum = sum(.)))
+lock <- xy %>% group_by(taxid) %>% summarize(ASV=paste(ASV, collapse=", ") )
+#Invert, spread columns
+morphSpread <- lock %>% group_by(species) %>% spread(site, final.carbon..mg.m3.)
+combo <- merge(NewCOI, lock, by=c('species', 'site'))
+```
+
+```{r for mega amplicon count tables}
+#Rcode for mega amplicon count tables
+MO_CP_counts <- read.delim("~/Documents/occi/MO_CP_counts.tsv", stringsAsFactors=FALSE)
+MO_EH_counts <- read.delim("~/Documents/occi/MO_EH_counts.tsv", stringsAsFactors=FALSE)
+megaocci <- merge(MO_CP_counts, MO_EH_counts, by=c('ASV'), all=TRUE)
+megaocci[is.na(megaocci)] <- 0
+table_MO_1.0_formatted <- read.delim("~/Documents/occi/table_MO_1.0_formatted.txt", stringsAsFactors=FALSE)
+#######
+#repeat
+#########
+megaCluster1 <- merge(table_MO_1.0_formatted,megaocci, by=c('ASV'))
+cluster1 <- megaCluster1 %>% group_by(cluster) %>% summarise_if(is.numeric, funs(sum = sum(.)))
+cluster1[cluster1< 20] <- 0
+cluster1[-1] <- +(cluster1[-1] > 0)
+clus1 <-  numcolwise(sum)(cluster1)
+#######
+#note rm samples with >5% meancoverage 825 removed 3 samples
+rowMeans(test)
+#[1] 16516.56
+#ASV's were removed if less than 20 copies per sample
+########
+```
+```{r format and graph}
+row.names(clus1) <- c('100')
+MOSpecies <- rbind(clus1,clus99)
+MOSpecies <- rbind(MOSpecies,clus98)
+
+######
+##Graph
+#######
+
+ MoLong <- as.data.frame(t(MOSpecies))
+ woohoo <- MoLong %>%  pivot_longer(c(1:7), names_to = "cluster", values_to = "species")
+ library(ggplot)
+ 
+ 
+MO <- ggplot(woohoo, aes(x=reorder(cluster, -species), y=species)) + geom_point(aes(col=cluster), show.legend = FALSE, size=1, alpha=1, position=position_jitter(w=0.4, h=0),)+ stat_summary(geom = "point", fun = mean)
+        
+MO+labs(x='Sequence Clusters Based on Percent Identification', y='Number of Sequences per Sample',  title=expression(paste("Number of ",italic("Nephromyces"), " species per ", italic("Molgula occidentalis"), “ and ”, italic(“Molgula manhattensis”), " individual")))
+
+AllM <- ggplot(Neph2hostsGraph, aes(x=reorder(cluster, -species), y=species), lable=annotation$`mean(species)`) + geom_point(aes(col=host), show.legend = FALSE, size=1, alpha=1, position=position_jitter(w=0.4, h=0),)+theme_bw()
+
+
+AllM+annotate('text', x=as.character(mm$cluster), y=mm$`mean(species)`, label=mm$`mean(species)`, color='black',size=5)+annotate('text', x=as.character(m0$cluster), y=m0$`mean(species)`, label=m0$`mean(species)`, color='black',size=5)+annotate('text', x=as.character(mm$cluster), y=mm$`mean(species)`, label=mm$`mean(species)`, color='red',size=4.55)+annotate('text', x=as.character(m0$cluster), y=m0$`mean(species)`, label=m0$`mean(species)`, color='cyan4',size=4.5)
+
+
+Neph2hostsGraph %>% group_by(cluster, host) %>% summarise(mean(species))
+annotation$mean <- round(annotation[,"mean(species)"],2)
+
+AllM <- ggplot(Neph2hostsGraph, aes(x=reorder(cluster, -species), y=species), lable=annotation$`mean(species)`) + geom_point(aes(col=host), show.legend = FALSE, size=0.5, alpha=1, position=position_jitter(w=0.4, h=0),)+theme_bw()
+
+eh <- AllM+labs(x='Sequence Clusters Based on Percent Identification', y='Number of Sequences per Sample', title = NULL)
+
+ eh+annotate('text', x=as.character(mm$cluster), y=40, label=mm$`mean(species)`, color='red',size=4.55)+annotate('text', x=as.character(m0$cluster), y=50, label=m0$`mean(species)`, color='cyan4',size=4.5)+annotate('text', x=4, y=130, label=expression(paste("Number of ",italic("Nephromyces"), " species per ", italic("Molgula occidentalis"), " and " )), size=5)+annotate('text', x=4.4, y=120, label=expression(paste(italic("Molgula manhattensis"), " individual")), size=5)
+```
+
+```{r bacterial work}
+acount[-1] <- +(alphacount[-1] > 0)
+alphaspecies <-  numcolwise(sum)(alphacount)
+
+
+row.names(alphaspecies) <- c('alpha')
+
+bacSpecies <- rbind(alphaFspecies,bacFspecies)
+mmlong <- as.data.frame(t(Species))
+mmlong$Total <- rowSums(mmlong[,c(1:3)])
+heyhey <- MObacCountSpeciesTable %>%  pivot_longer(c(1:4), names_to = "sample", values_to = "species")
+```
+
+```{r graph bacteria abundance and type}
+MD <- ggplot(heyhey, aes(x=reorder(sample, -species), y=species)) + geom_point(aes(col=sample), show.legend = FALSE, size=1, alpha=1, position=position_jitter(w=0.4, h=0),)+ stat_summary(geom = "point", fun = mean)
+
+MD+labs(x='Symbiont Type', y='Number of Sequences per Sample',  title=expression(paste("Number and Type of Bacterial Endosymbionts per ",italic("Molgula occidentalis"), " individual" )))+MD+theme_bw()
+
+AllM+annotate('text', x=as.character(annot$cluster), y=annot$`mean(species)`, label=annot$`mean(species)`,R code for bacteria
+-min length set to 400 bp all bac sequences
+
+alphacount <- merge(alphahead,MO_FL_EH_count, by=c('ASV'))
+alphacount[is.na(alphacount)] <- 0
+alphacount[alphacount< 20] <- 0
+alph colour=annot$host)
+```
+ 
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
